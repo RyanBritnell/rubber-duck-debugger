@@ -2,14 +2,12 @@
 
 [Rubber duck debugging](https://en.wikipedia.org/wiki/Rubber_duck_debugging) is a tried-and-tested method: explain your code problem to a rubber duck, walk through your code line-by-line, and the solution often reveals itself. But what if the duck could talk back?
 
-The Rubber Duck Debugger is a hotline built with [Twilio](https://www.twilio.com) and [Claude AI](https://claude.com/). Call in, explain your problem, and get help finding the solution!
-
-I built this as a fun [Track Jacket](https://www.twilio.com/en-us/blog/developers/tutorials/product/sms-email-responder-python-flask) project - a Twilio tradition for understanding our developer experience through hands-on building.
+The Rubber Duck Debugger is a AI debugging hotline built with [Twilio](https://www.twilio.com) and [Claude](https://claude.com/).
 
 ## What It Does
 
 1. **Call the hotline** - Dial your Twilio number to connect with the rubber duck
-2. **Talk through your problem** - Explain your code issue, if inspiration hasn't struck after a few seconds, the duck will ask questions and suggest solutions
+2. **Talk through your problem** - Explain your issue to the duck. There's a built-in pause to give you time to think - if inspiration doesn't strike after a few seconds, then the duck starts asking questions and suggesting solutions
 3. **Get the transcript** - Receive the full conversation via SMS when the call ends
 
 ## Tech Stack
