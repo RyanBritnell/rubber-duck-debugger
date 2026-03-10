@@ -1,16 +1,32 @@
 import os
 import json
 import uuid  # For generating unique session IDs
+import asyncio  # For adding pause before AI responds
 
+from typing import Literal, Optional
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect
+from pydantic import BaseModel
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client  # Twilio REST client for sending SMS
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ========================================
+# Pydantic Models for WebSocket Message Validation
+# ========================================
+
+class WebSocketMessage(BaseModel):
+    """
+    Uses Pydantic to validate incoming WebSocket messages from Twilio's ConversationRelay. 
+    
+    Messages outside the 4 named are logged and skipped silently.
+    """
+    type: Literal["setup", "prompt", "interrupt", "disconnect"]
+    voicePrompt: Optional[str] = None
 
 # ========================================
 # STEP 1: Configuration and API Keys
@@ -20,6 +36,9 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 
+# Rubber duck debugging pause - gives user time to think before AI responds
+THINKING_PAUSE_SECONDS = 3.0
+
 # Twilio credentials for sending SMS transcripts
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
@@ -28,6 +47,8 @@ TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 # Telling the AI how to behave
 SYSTEM_MESSAGE = ("""
 System Role: You are a Rubber Duck Debugger, a virtual rubber duck debugging assistant: en.wikipedia.org/wiki/Rubber_duck_debugging. Your job is to help developers solve coding problems through the "Rubber Duck Debugging" method via voice call.
+
+Important Context: There is a deliberate pause built into the system after the developer speaks and before you respond. This pause gives them time to sit with their thoughts and think through their problem. Often, just explaining a problem out loud leads to discovering the solution. Be aware that this pause exists and that it's intentional - the developer has already had a moment to reflect before you speak.
 
 Voice Constraints:
 - Be Concise: Keep responses short. In a voice environment, long monologues are hard to follow.
@@ -58,11 +79,10 @@ app = FastAPI()
 if not ANTHROPIC_API_KEY:
     raise ValueError("No Anthropic API key present in environment variables")
 
-# Initialize Anthropic client for AI responses
+# Initialize Anthropic client for Claude responses
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Initialize Twilio client for sending SMS (only if credentials are provided)
-# This is optional - if not configured, transcripts just won't be sent
+# Initialize Twilio client for sending SMS - optional
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -76,18 +96,21 @@ else:
 
 # Dictionary to store active call sessions
 # Key: session_id (unique identifier for each call)
-# Value: dict containing 'caller_number' and 'conversation_history'
-# This allows us to track which phone number belongs to which WebSocket connection
+# Value: dict containing:
+#   - 'caller_number': Phone number in E.164 format
+#   - 'conversation_history': List of message dicts with 'role' and 'content'
+#   - 'transcript_sent': Boolean flag to prevent duplicate SMS sends
+# This lets us track which phone number belongs to which WebSocket connection
 active_sessions = {}
 
 
 # ========================================
-# STEP 4: Helper Function to Format Transcript
+# STEP 4: Helper Functions for SMS Transcripts
 # ========================================
 
 def format_transcript(conversation_history):
     """
-    Convert conversation history into a readable SMS transcript.
+    Converts conversation history into a readable transcript.
 
     Args:
         conversation_history: List of dicts with 'role' and 'content' keys
@@ -108,7 +131,7 @@ def format_transcript(conversation_history):
             # User's messages are prefixed with "You:"
             transcript += f"You: {content}\n\n"
         elif role == 'assistant':
-            # Duck's messages are prefixed with "Duck:"
+            # Duck's messages are prefixed with "Duck Debugger:"
             transcript += f"Duck: {content}\n\n"
 
     # Add a footer
@@ -125,7 +148,7 @@ def send_sms_transcript(phone_number, conversation_history):
         phone_number: The phone number to send the SMS to (E.164 format)
         conversation_history: List of conversation messages to format
     """
-    print(f"🔍 send_sms_transcript called with phone: {phone_number}, history items: {len(conversation_history)}")
+    print(f"🔍 send_sms_transcript called with phone: {phone_number}")
 
     # Check if Twilio is configured
     if not twilio_client:
@@ -133,11 +156,6 @@ def send_sms_transcript(phone_number, conversation_history):
         print(f"   TWILIO_ACCOUNT_SID: {'set' if TWILIO_ACCOUNT_SID else 'NOT SET'}")
         print(f"   TWILIO_AUTH_TOKEN: {'set' if TWILIO_AUTH_TOKEN else 'NOT SET'}")
         print(f"   TWILIO_PHONE_NUMBER: {TWILIO_PHONE_NUMBER if TWILIO_PHONE_NUMBER else 'NOT SET'}")
-        return
-
-    # Check if we have any conversation to send
-    if not conversation_history:
-        print("⚠ No conversation to send - history is empty")
         return
 
     try:
@@ -169,12 +187,6 @@ def send_sms_transcript(phone_number, conversation_history):
         import traceback
         print(f"   Full traceback:\n{traceback.format_exc()}")
 
-
-@app.get("/", response_class=JSONResponse)
-async def index_page():
-    return {"message": "Twilio ConversationRelay with Claude is running!"}
-
-
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """
@@ -190,31 +202,28 @@ async def handle_incoming_call(request: Request):
     # Get form data from Twilio's webhook
     # Twilio sends the caller's number in the 'From' parameter
     form_data = await request.form()
-    caller_number = form_data.get('From')  # E.164 format like +15551234567
-    print(caller_number)
+    caller_number = form_data.get('From')
 
     # Generate a unique session ID for this call
     # This ID will be passed to the WebSocket to link the phone number to the connection
     session_id = str(uuid.uuid4())
 
-    # Store the session information
-    # We'll use this in the WebSocket handler to know who to send the transcript to
+    # Store the session information with all required fields
+    # - caller_number: Used to send SMS transcript after call ends
+    # - conversation_history: Accumulates all messages during the call
+    # - transcript_sent: Prevents duplicate SMS if cleanup runs multiple times
     active_sessions[session_id] = {
         'caller_number': caller_number,
-        'conversation_history': []  # Will be populated during the call
+        'conversation_history': [],
+        'transcript_sent': False
     }
-
-    print(f"📞 Incoming call from {caller_number}")
-    print(f"   Session ID: {session_id}")
 
     # ========================================
     # STEP 6: Build TwiML Response
     # ========================================
 
+    # Begin building the TwiML
     response = VoiceResponse()
-    response.say("Please wait while we connect your call to the Rubber Duck Debugger, powered by Twilio and Claude")
-    response.pause(length=1)
-    response.say("O.K. you can start talking now!")
 
     # Connect to WebSocket with session ID in the URL
     # The session_id query parameter will be available in the WebSocket handler
@@ -226,7 +235,11 @@ async def handle_incoming_call(request: Request):
         language='en-US',
         tts_provider='amazon'
     )
+
+    response.say("You're connected to the Rubber Duck Debugger, powered by Twilio and Claude", voice="Polly.Joanna-Neural")
+
     response.append(connect)
+
 
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -236,8 +249,11 @@ async def handle_websocket(websocket: WebSocket):
     """
     Handle WebSocket connection for ConversationRelay.
 
-    This maintains the real-time conversation with the caller and sends
-    the transcript via SMS when the call ends.
+    This function:
+    1. Maintains real-time conversation with the caller via Claude AI
+    2. Validates all incoming messages using Pydantic model `WebSocketMessage`
+    3. Streams AI responses back to Twilio for text-to-speech
+    4. Sends conversation transcript via SMS in the finally block
     """
     print("=== Client connected to ConversationRelay WebSocket ===")
     await websocket.accept()
@@ -247,23 +263,14 @@ async def handle_websocket(websocket: WebSocket):
     # STEP 7: Extract Session Information
     # ========================================
 
-    # Get the session_id from query parameters
-    # This was passed in the URL from the /incoming-call endpoint
+    # Get the session_id from query parameters passed by /incoming-call endpoint
     session_id = websocket.query_params.get('session_id')
 
-    # Retrieve session data (contains caller_number and conversation_history)
+    # Retrieve session data containing caller_number, conversation_history, and transcript_sent flag
     session_data = active_sessions.get(session_id)
 
-    if not session_data:
-        print(f"⚠ Warning: No session found for ID {session_id}")
-        # Create a fallback session if something went wrong
-        session_data = {
-            'caller_number': None,
-            'conversation_history': []
-        }
-
-    # Get reference to the conversation history for this call
-    # This is shared with the session, so updates here persist in active_sessions
+    # Get reference to conversation history for this call
+    # This is shared with the session, so updates here will persist in active_sessions dict
     conversation_history = session_data['conversation_history']
 
     print(f"📱 Session {session_id[:8]}... connected")
@@ -272,25 +279,36 @@ async def handle_websocket(websocket: WebSocket):
 
     try:
         async for message in websocket.iter_text():
-            print(f"=== Raw message received: {message[:200]}...")
-            data = json.loads(message)
-            print(f"=== Parsed data: {json.dumps(data, indent=2)}")
+            # ========================================
+            # STEP 8: Validate Incoming Messages
+            # ========================================
+            try:
+                # Parse JSON and validate ws message with Pydantic
+                data = json.loads(message)
+                ws_message = WebSocketMessage(**data)
+                event_type = ws_message.type
+                print(f"=== Received event type: {event_type} ===")
 
-            # Log incoming messages for debugging
-            event_type = data.get('type')
-            print(f"=== Received event type: {event_type} ===")
+            except json.JSONDecodeError as e:
+                # Skip messages that aren't valid JSON
+                print(f"❌ Invalid JSON received: {e}")
+                continue
+            except Exception as e:
+                # Skip messages that fail WebSocketMessage validation
+                print(f"❌ Message validation failed: {e}")
+                continue
 
-            # DEBUG: Log all event types we receive
-            print(f"🔍 EVENT DEBUG - Type: '{event_type}' | Known types: setup, prompt, interrupt, disconnect")
+            # ========================================
+            # STEP 9: Handle Different Event Types
+            # ========================================
 
-            # Handle setup event
+            # Setup event: Connection established, no response needed
             if event_type == 'setup':
-                # No response needed for setup, just log it
                 print("Setup received - ready for prompts")
 
-            # Handle prompt event - this is where we call Claude
+            # Prompt event: User spoke, call Claude for response
             elif event_type == 'prompt':
-                user_message = data.get('voicePrompt', '')
+                user_message = ws_message.voicePrompt or ''
                 print(f"User said: {user_message}")
 
                 # Add user message to conversation history
@@ -298,6 +316,13 @@ async def handle_websocket(websocket: WebSocket):
                     "role": "user",
                     "content": user_message
                 })
+
+                # Pause before responding - this gives the user time to think
+                # The rubber duck debugging method works because explaining the problem
+                # often leads to discovering the solution. This pause encourages that.
+                print(f"⏸️  Pausing for {THINKING_PAUSE_SECONDS} seconds to let user think...")
+                await asyncio.sleep(THINKING_PAUSE_SECONDS)
+                print("▶️  Pause complete, generating AI response...")
 
                 try:
                     # Call Claude API with streaming enabled for lower latency
@@ -361,90 +386,57 @@ async def handle_websocket(websocket: WebSocket):
                     }
                     await websocket.send_json(error_response)
 
-            # Handle interrupt event
+            # Interrupt event: User interrupted AI response (e.g., by speaking)
             elif event_type == 'interrupt':
                 print("Conversation interrupted by user")
-
-            # Handle disconnect event
-            elif event_type == 'disconnect':
-                print("📴 Call ended - preparing to send transcript")
-
-                # ========================================
-                # STEP 8: Send SMS Transcript on Disconnect
-                # ========================================
-
-                # Get the caller's phone number from this session
-                caller_number = session_data.get('caller_number')
-
-                # DEBUG: Print detailed information about what we have
-                print(f"🔍 DEBUG - Session ID: {session_id}")
-                print(f"🔍 DEBUG - Caller number: {caller_number}")
-                print(f"🔍 DEBUG - Conversation history length: {len(conversation_history)}")
-                print(f"🔍 DEBUG - Twilio client initialized: {twilio_client is not None}")
-
-                # Only send SMS if we have a valid phone number and conversation history
-                if caller_number and conversation_history:
-                    print(f"📤 Sending transcript to {caller_number}...")
-                    send_sms_transcript(caller_number, conversation_history)
-                elif not caller_number:
-                    print("⚠ Cannot send transcript - caller_number is missing or empty")
-                elif not conversation_history:
-                    print("⚠ Cannot send transcript - conversation_history is empty")
-
-                # Clean up the session from memory
-                # No need to keep it around after the call ends
-                if session_id in active_sessions:
-                    del active_sessions[session_id]
-                    print(f"🧹 Session {session_id[:8]}... cleaned up")
-
-                break
-
-    except WebSocketDisconnect:
-        print("🔌 WebSocket disconnected (this is normal when call ends)")
-
-        # ========================================
-        # STEP 9: Handle WebSocket Disconnects
-        # ========================================
-        # This is likely where we end up when the call ends
-        # Twilio may close the WebSocket without sending a 'disconnect' event
+                # No action needed - just log it
 
     except Exception as e:
+        # Catch any unexpected errors that occur during the WebSocket loop
+        # This prevents crashes and logs the error for debugging
         print(f"❌ Error in WebSocket handler: {e}")
         import traceback
         print(traceback.format_exc())
 
     finally:
         # ========================================
-        # FINAL CLEANUP - ALWAYS RUNS
+        # STEP 10: Cleanup and Send Transcript
         # ========================================
-        # This block runs no matter how the WebSocket closes
-        # (normal disconnect event, WebSocketDisconnect exception, or error)
+        # This block runs when the WebSocket connection closes
+        # (the async iterator exits naturally when the connection ends)
+        # The transcript_sent flag ensures SMS is only sent once
 
         print("🧹 WebSocket closing - final cleanup")
 
-        # Get the caller's phone number from this session
+        # Extract session data for SMS sending
         caller_number = session_data.get('caller_number')
+        transcript_sent = session_data.get('transcript_sent', False)
 
-        # DEBUG: Show what we have
         print(f"🔍 FINAL - Caller number: {caller_number}")
         print(f"🔍 FINAL - Conversation history length: {len(conversation_history)}")
+        print(f"🔍 FINAL - Transcript already sent: {transcript_sent}")
 
-        # Try to send transcript if we have the necessary data
-        if caller_number and conversation_history:
+        # Send SMS transcript if:
+        # 1. We have a valid phone number
+        # 2. Conversation history is not empty
+        # 3. We haven't already sent the transcript (prevents duplicates)
+        if caller_number and conversation_history and not transcript_sent:
             print(f"📤 Sending transcript to {caller_number}...")
             send_sms_transcript(caller_number, conversation_history)
+            session_data['transcript_sent'] = True  # Mark as sent
+        elif transcript_sent:
+            print("✓ Transcript already sent - skipping duplicate")
         elif not caller_number:
             print("⚠ Cannot send transcript - no caller number")
         elif not conversation_history:
-            print("⚠ Cannot send transcript - conversation history is empty")
+            print("⚠ Cannot send transcript - No conversation to send because the history is empty.")
 
-        # Clean up session from memory
+        # Remove session from memory - no longer needed after call ends
         if session_id and session_id in active_sessions:
             del active_sessions[session_id]
             print(f"✅ Session {session_id[:8]}... cleaned up")
 
         print("👋 WebSocket handler complete")
-
 
 if __name__ == "__main__":
     import uvicorn
