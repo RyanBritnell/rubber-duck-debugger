@@ -28,7 +28,7 @@ Before you begin, ensure you have:
   - A [phone number](https://www.twilio.com/en-us/phone-numbers) that supports voice
   - Account SID and Auth Token (find them in the [Twilio Console](https://console.twilio.com/))
 - **Anthropic API key** - Get one from [Anthropic Console](https://console.anthropic.com/)
-- **Grok** (for local deployment and testing) - [Install Grok](https://grok.app/)
+- **ngrok** (for local deployment and testing) - [Install ngrok](https://ngrok.app/)
 
 ## Setup
 
@@ -37,7 +37,7 @@ Before you begin, ensure you have:
 uv sync
 ```
 
-2. Create `.env` file:
+2. In the root of the project, create a new `.env` file:
 ```bash
 ANTHROPIC_API_KEY=your_claude_api_key
 TWILIO_ACCOUNT_SID=your_twilio_sid
@@ -48,18 +48,18 @@ PORT=5050
 
 3. Run the server:
 ```bash
-python main.py
+uv run python main.py
 ```
 
-4. Expose your local server with Grok (for local development):
+4. Expose your local server with ngrok (for local development):
 ```bash
-grok http 5050
+ngrok http 5050
 ```
-Copy the `https://` forwarding URL from the Grok output (e.g., `https://abc123.grok.app`)
+Copy the `https://` forwarding URL from the ngrok output (e.g., `https://abc123.ngrok.app`)
 
 5. Configure Twilio webhook:
    - Go to your Twilio phone number settings
-   - Set the webhook URL (e.g., `https://abc123.grok.app`)
+   - Set the webhook URL (e.g., `https://abc123.ngrok.app`)
    - Save the configuration
 
 ## Features

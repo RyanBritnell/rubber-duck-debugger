@@ -22,10 +22,9 @@ load_dotenv()
 class WebSocketMessage(BaseModel):
     """
     Uses Pydantic to validate incoming WebSocket messages from Twilio's ConversationRelay.
-
-    Messages outside the 4 named are logged and skipped silently.
+    Only validates the fields defined below; extra fields from Twilio are ignored.
     """
-    model_config = {"extra": "ignore"}  # Allow extra fields from Twilio
+    model_config = {"extra": "ignore"}
 
     type: Literal["setup", "prompt", "interrupt", "disconnect"]
     voicePrompt: Optional[str] = None
@@ -39,7 +38,7 @@ ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 
 # Rubber duck debugging pause - gives user time to think before AI responds
-THINKING_PAUSE_SECONDS = 1.0
+THINKING_PAUSE_SECONDS = 7.0
 
 # Twilio credentials for sending SMS transcripts
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
@@ -166,22 +165,54 @@ def send_sms_transcript(phone_number, conversation_history):
         print(f"🔍 Transcript formatted, length: {len(transcript)} characters")
 
         # Twilio SMS has a 1600 character limit
-        # If transcript is too long, we'll truncate and add a note
-        if len(transcript) > 1500:
-            transcript = transcript[:1500] + "\n\n... (Transcript truncated due to SMS length limits)"
-            print(f"⚠ Transcript truncated to 1500 characters")
+        # Split into multiple messages if needed
+        MAX_SMS_LENGTH = 1500  # Leave buffer for message numbering
 
-        # Send the SMS using Twilio's API
-        print(f"🔍 Attempting to send SMS from {TWILIO_PHONE_NUMBER} to {phone_number}...")
-        message = twilio_client.messages.create(
-            body=transcript,
-            from_=TWILIO_PHONE_NUMBER,  # Your Twilio number
-            to=phone_number              # Caller's number
-        )
+        if len(transcript) <= MAX_SMS_LENGTH:
+            # Single message - send as is
+            print(f"🔍 Attempting to send SMS from {TWILIO_PHONE_NUMBER} to {phone_number}...")
+            message = twilio_client.messages.create(
+                body=transcript,
+                from_=TWILIO_PHONE_NUMBER,
+                to=phone_number
+            )
+            print(f"✓ Transcript sent successfully to {phone_number}")
+            print(f"  Message SID: {message.sid}")
+        else:
+            # Multiple messages needed - split intelligently
+            print(f"📩 Transcript is {len(transcript)} chars - splitting into multiple messages...")
 
-        print(f"✓ Transcript sent successfully to {phone_number}")
-        print(f"  Message SID: {message.sid}")
-        print(f"  Status: {message.status}")
+            # Split on double newlines (between messages) to avoid breaking mid-thought
+            chunks = []
+            current_chunk = ""
+
+            for line in transcript.split("\n"):
+                # If adding this line would exceed limit, start new chunk
+                if len(current_chunk) + len(line) + 1 > MAX_SMS_LENGTH:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = line + "\n"
+                else:
+                    current_chunk += line + "\n"
+
+            # Add remaining chunk
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+
+            # Send each chunk with numbering
+            total_parts = len(chunks)
+            for i, chunk in enumerate(chunks, 1):
+                message_body = f"({i}/{total_parts})\n\n{chunk}"
+
+                print(f"🔍 Sending part {i}/{total_parts} from {TWILIO_PHONE_NUMBER} to {phone_number}...")
+                message = twilio_client.messages.create(
+                    body=message_body,
+                    from_=TWILIO_PHONE_NUMBER,
+                    to=phone_number
+                )
+                print(f"✓ Part {i}/{total_parts} sent - SID: {message.sid}")
+
+            print(f"✓ All {total_parts} transcript parts sent successfully to {phone_number}")
 
     except Exception as e:
         # Log error but don't crash if SMS fails
@@ -275,6 +306,9 @@ async def handle_websocket(websocket: WebSocket):
     # This is shared with the session, so updates here will persist in active_sessions dict
     conversation_history = session_data['conversation_history']
 
+    # Flag to track if user interrupted AI response. Used to stop streaming from Claude back to user
+    interrupted = False
+
     print(f"📱 Session {session_id[:8]}... connected")
     if session_data['caller_number']:
         print(f"   Caller: {session_data['caller_number']}")
@@ -325,11 +359,14 @@ async def handle_websocket(websocket: WebSocket):
                 # # Pause before responding - this gives the user time to think
                 # # The rubber duck debugging method works because explaining the problem
                 # # often leads to discovering the solution. This pause encourages that.
-                # print(f"⏸️  Pausing for {THINKING_PAUSE_SECONDS} seconds to let user think...")
-                # await asyncio.sleep(THINKING_PAUSE_SECONDS)
-                # print("▶️  Pause complete, generating AI response...")
+                print(f"⏸️  Pausing for {THINKING_PAUSE_SECONDS} seconds to let user think...")
+                await asyncio.sleep(THINKING_PAUSE_SECONDS)
+                print("▶️  Pause complete, generating AI response...")
 
                 try:
+                    # Reset interrupt flag before starting new response
+                    interrupted = False
+
                     # Call Claude API with streaming enabled for lower latency
                     stream = anthropic_client.messages.create(
                         model="claude-sonnet-4-6",
@@ -344,6 +381,12 @@ async def handle_websocket(websocket: WebSocket):
 
                     # Stream tokens back to Twilio as they arrive from Claude
                     for event in stream:
+                        # Check if user interrupted
+                        if interrupted:
+                            print("🛑 Streaming cancelled due to user interrupt")
+                            stream.close()
+                            break
+
                         if event.type == "content_block_start":
                             print("Stream started")
 
@@ -358,28 +401,32 @@ async def handle_websocket(websocket: WebSocket):
                                     'type': 'text',
                                     'token': token,
                                     'last': False,
-                                    'interruptible': True
+                                    'interruptible': True #Send interruptible=True with every token so that user can interrupt at any time during the response
                                 }
                                 await websocket.send_json(token_message)
 
                         elif event.type == "content_block_stop":
                             print(f"Stream complete. Full response: {full_response}")
 
-                    # Send final message indicating completion
-                    final_message = {
-                        'type': 'text',
-                        'token': '',
-                        'last': True,
-                        'interruptible': True
-                    }
-                    await websocket.send_json(final_message)
+                    # Send final message indicating completion (or cancellation)
+                    if not interrupted:
+                        final_message = {
+                            'type': 'text',
+                            'token': '',
+                            'last': True,
+                            'interruptible': True
+                        }
+                        await websocket.send_json(final_message)
+                        print("Response sent and saved to history")
+                    else:
+                        print("Response interrupted - not saving to history")
 
-                    # Add complete assistant response to conversation history
-                    conversation_history.append({
-                        "role": "assistant",
-                        "content": full_response
-                    })
-                    print("Response sent and saved to history")
+                    # Add complete assistant response to conversation history (only if not interrupted)
+                    if not interrupted and full_response:
+                        conversation_history.append({
+                            "role": "assistant",
+                            "content": full_response
+                        })
 
                 except Exception as e:
                     print(f"Error calling Claude API: {e}")
@@ -393,8 +440,8 @@ async def handle_websocket(websocket: WebSocket):
 
             # Interrupt event: User interrupted AI response (e.g., by speaking)
             elif event_type == 'interrupt':
-                print("Conversation interrupted by user")
-                # No action needed - just log it
+                print("Conversation interrupted by user - setting interrupt flag")
+                interrupted = True
 
     except Exception as e:
         # Catch any unexpected errors that occur during the WebSocket loop
