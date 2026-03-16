@@ -21,10 +21,12 @@ load_dotenv()
 
 class WebSocketMessage(BaseModel):
     """
-    Uses Pydantic to validate incoming WebSocket messages from Twilio's ConversationRelay. 
-    
+    Uses Pydantic to validate incoming WebSocket messages from Twilio's ConversationRelay.
+
     Messages outside the 4 named are logged and skipped silently.
     """
+    model_config = {"extra": "ignore"}  # Allow extra fields from Twilio
+
     type: Literal["setup", "prompt", "interrupt", "disconnect"]
     voicePrompt: Optional[str] = None
 
@@ -37,7 +39,7 @@ ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 
 # Rubber duck debugging pause - gives user time to think before AI responds
-THINKING_PAUSE_SECONDS = 3.0
+THINKING_PAUSE_SECONDS = 1.0
 
 # Twilio credentials for sending SMS transcripts
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
@@ -285,6 +287,8 @@ async def handle_websocket(websocket: WebSocket):
             try:
                 # Parse JSON and validate ws message with Pydantic
                 data = json.loads(message)
+                print(f"🔍 Raw Twilio message: {json.dumps(data, indent=2)}")
+
                 ws_message = WebSocketMessage(**data)
                 event_type = ws_message.type
                 print(f"=== Received event type: {event_type} ===")
@@ -308,6 +312,7 @@ async def handle_websocket(websocket: WebSocket):
 
             # Prompt event: User spoke, call Claude for response
             elif event_type == 'prompt':
+                print("Recieved prompt event")
                 user_message = ws_message.voicePrompt or ''
                 print(f"User said: {user_message}")
 
@@ -317,12 +322,12 @@ async def handle_websocket(websocket: WebSocket):
                     "content": user_message
                 })
 
-                # Pause before responding - this gives the user time to think
-                # The rubber duck debugging method works because explaining the problem
-                # often leads to discovering the solution. This pause encourages that.
-                print(f"⏸️  Pausing for {THINKING_PAUSE_SECONDS} seconds to let user think...")
-                await asyncio.sleep(THINKING_PAUSE_SECONDS)
-                print("▶️  Pause complete, generating AI response...")
+                # # Pause before responding - this gives the user time to think
+                # # The rubber duck debugging method works because explaining the problem
+                # # often leads to discovering the solution. This pause encourages that.
+                # print(f"⏸️  Pausing for {THINKING_PAUSE_SECONDS} seconds to let user think...")
+                # await asyncio.sleep(THINKING_PAUSE_SECONDS)
+                # print("▶️  Pause complete, generating AI response...")
 
                 try:
                     # Call Claude API with streaming enabled for lower latency
